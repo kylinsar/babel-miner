@@ -54,18 +54,43 @@ class RetryTests(unittest.TestCase):
         response=Response();response.status_code=status
         return b.HTTPError('secret URL must never be logged',response=response)
     def test_transient_reads_recover(self):
-        for error in (self.error(429), self.error(503), b.Timeout(), b.ConnectionError()):
+        for error, delay in ((self.error(429), 15), (self.error(503), 2), (b.Timeout(), 2), (b.ConnectionError(), 2)):
             fn=Mock(side_effect=[error,'fresh'])
             with patch.object(b.time,'sleep') as sleep, contextlib.redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(b.read_retry(fn),'fresh')
-            sleep.assert_called_once_with(2)
+            sleep.assert_called_once_with(delay)
             self.assertNotIn('secret',out.getvalue())
     def test_retry_limit(self):
         fn=Mock(side_effect=self.error(503))
-        with patch.object(b.time,'sleep') as sleep, self.assertRaisesRegex(b.SafetyError,'HTTP 503'):
+        with patch.object(b.time,'sleep') as sleep, self.assertRaisesRegex(b.RpcReadError,'HTTP 503'):
             b.read_retry(fn)
         self.assertEqual(fn.call_count,4)
         self.assertEqual([c.args[0] for c in sleep.call_args_list],[2,4,8])
+    def test_429_backoff_and_retry_after(self):
+        self.assertEqual(b.retry_delay(self.error(429),0),15)
+        err=self.error(429);err.response.headers['Retry-After']='7'
+        self.assertEqual(b.retry_delay(err,0),7)
+        fn=Mock(side_effect=self.error(429))
+        with patch.object(b.time,'sleep') as sleep, self.assertRaisesRegex(b.RpcReadError,'HTTP 429'):
+            b.read_retry(fn)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list],[15,30,60])
+    def test_retry_until_deadline(self):
+        fn=Mock(side_effect=[self.error(429), self.error(429), 'fresh'])
+        with patch.object(b.time,'sleep'):
+            self.assertEqual(b.read_retry(fn, time.monotonic()+60),'fresh')
+        self.assertEqual(fn.call_count,3)
+    def test_poll_job_does_not_retry(self):
+        chain=object.__new__(b.Chain)
+        chain._poll_state=Mock(side_effect=self.error(429))
+        with patch.object(b.time,'sleep') as sleep, self.assertRaisesRegex(b.RpcReadError,'HTTP 429'):
+            chain.job(poll=True)
+        sleep.assert_not_called();chain._poll_state.assert_called_once()
+    def test_poll_error_keeps_hashing_then_stale_stop(self):
+        job=b.Job(5729,bytes(32),1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(b.after_poll_error('HTTP 429',job,2,100,110),15)
+            with self.assertRaisesRegex(b.SafetyError,'连续 180 秒'):
+                b.after_poll_error('HTTP 429',job,15,0,181)
     def test_permanent_error_no_retry(self):
         fn=Mock(side_effect=self.error(403))
         with patch.object(b.time,'sleep') as sleep, self.assertRaisesRegex(b.SafetyError,'HTTP 403'):
@@ -80,7 +105,7 @@ class RetryTests(unittest.TestCase):
         with self.assertRaisesRegex(b.SafetyError,'budget'): b.read_retry(fn)
         self.assertEqual(fn.call_count,1)
     def test_menu_cuda_does_not_ask_cpu(self):
-        p=subprocess.run(['bash',str(b.HERE/'babel-menu.sh')],input='8\ncuda\n0\n0\n',capture_output=True,text=True,timeout=5)
+        p=subprocess.run(['bash',str(b.HERE/'babel-menu.sh')],input='8\ncuda\n0\n\n0\n',capture_output=True,text=True,timeout=5)
         self.assertEqual(p.returncode,0)
         self.assertIn('CUDA GPU=0',p.stdout)
         self.assertNotIn('backend=cuda | devices=0 | CPU=',p.stdout)

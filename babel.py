@@ -35,6 +35,11 @@ ABI = [
 ]
 
 class SafetyError(Exception): pass
+class RpcReadError(SafetyError): pass
+
+POLL_BACKOFF_MIN = 15
+POLL_BACKOFF_MAX = 60
+STALE_POLL = 180
 
 def log(msg): print(time.strftime('[%H:%M:%S]'), msg, flush=True)
 def kh(data): return keccak.new(digest_bits=256, data=data).digest()
@@ -70,24 +75,53 @@ def rpc_error_label(exc):
         return f'HTTP {response.status_code}' if response is not None else 'HTTPError（无状态码）'
     return type(exc).__name__
 
+def http_status(exc):
+    if isinstance(exc, HTTPError) and exc.response is not None:
+        return exc.response.status_code
+    return None
+
+def transient_rpc(exc):
+    if not isinstance(exc, HTTPError):
+        return True
+    return http_status(exc) in (408, 425, 429, 500, 502, 503, 504)
+
+def retry_delay(exc, attempt):
+    response = exc.response if isinstance(exc, HTTPError) else None
+    raw = response.headers.get('Retry-After') if response is not None and response.headers else None
+    if raw and re.fullmatch(r'[0-9]{1,4}', raw.strip()):
+        return min(max(int(raw.strip()), 1), POLL_BACKOFF_MAX)
+    if http_status(exc) == 429:
+        return min(POLL_BACKOFF_MIN * (2 ** attempt), POLL_BACKOFF_MAX)
+    return 2 ** (attempt + 1)
+
 def read_retry(fn, deadline=None):
     """Only call with idempotent task reads; never wrap signing/broadcast."""
-    for attempt in range(4):
+    attempt = 0
+    while True:
         if deadline is not None and time.monotonic() >= deadline:
             raise SafetyError('运行时间已到，停止读取重试')
         try:
             return fn()
         except (HTTPError, ConnectionError, Timeout) as exc:
-            status = exc.response.status_code if isinstance(exc, HTTPError) and exc.response is not None else None
-            transient = not isinstance(exc, HTTPError) or status in (408, 425, 429, 500, 502, 503, 504)
             label = rpc_error_label(exc)
-            if not transient or attempt == 3:
-                raise SafetyError(f'RPC任务读取失败：{label}；已停止，没有自动重发交易') from None
-            delay = 2 ** (attempt + 1)
+            if not transient_rpc(exc) or (deadline is None and attempt >= 3):
+                raise RpcReadError(f'RPC任务读取失败：{label}；已停止，没有自动重发交易') from None
+            delay = retry_delay(exc, min(attempt, 4))
             if deadline is not None:
-                delay = min(delay, max(0, deadline-time.monotonic()))
-            log(f'RPC任务读取失败：{label}；暂停下发计算任务，{delay:g}秒后重试（{attempt+1}/3）')
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    raise SafetyError('运行时间已到，停止读取重试') from None
+                delay = min(delay, remain)
+            log(f'RPC任务读取失败：{label}；{delay:g}秒后重试（第{attempt+1}次；不重发交易）')
             time.sleep(delay)
+            attempt += 1
+
+def after_poll_error(label, job, poll_wait, last_good, now):
+    if now - last_good > STALE_POLL:
+        raise SafetyError(f'RPC 已连续 {STALE_POLL} 秒不可用，已停止，没有自动重发交易')
+    wait = min(max(poll_wait * 2, POLL_BACKOFF_MIN), POLL_BACKOFF_MAX)
+    log(f'RPC轮询 {label}；GPU继续当前 laid={job.laid}，{wait:g}秒后再查（不停止、不重发交易）')
+    return wait
 
 
 class Chain:
@@ -101,16 +135,32 @@ class Chain:
         expected=json.loads((HERE/'protocol.json').read_text())['code_sha256']
         code=bytes(self.w3.eth.get_code(CONTRACT))
         if not code or hashlib.sha256(code).hexdigest()!=expected: raise SafetyError('合约字节码与固定版本不一致')
-    def job(self, deadline=None):
+    def job(self, deadline=None, *, poll=False):
+        if poll:
+            try:
+                return self._poll_state()
+            except (HTTPError, ConnectionError, Timeout) as exc:
+                label = rpc_error_label(exc)
+                if not transient_rpc(exc):
+                    raise SafetyError(f'RPC任务读取失败：{label}；已停止，没有自动重发交易') from None
+                raise RpcReadError(label) from None
         return read_retry(self._job, deadline)
+    def _snapshot(self, s, block):
+        if s['laid']>=8190: raise SafetyError('所有公开砖块已铸造完毕')
+        if not s['openAt']: raise SafetyError('铸造尚未开放')
+        target=s['target']
+        if not 0<target<=MAX256: raise SafetyError('纯挖矿 target 无效')
+        return Job(s['laid'],bytes(s['seed']),target,block,s['price'],s['openAt'])
+    def _poll_state(self):
+        # One eth_call per poll so a shared website RPC is less likely to 429.
+        return self._snapshot(dict(zip(FIELDS,self.contract.functions.state().call())), 0)
     def _job(self):
         block=self.w3.eth.block_number
         s=dict(zip(FIELDS,self.contract.functions.state().call(block_identifier=block)))
-        if s['laid']>=8190: raise SafetyError('所有公开砖块已铸造完毕')
-        if not s['openAt']: raise SafetyError('铸造尚未开放')
+        job=self._snapshot(s,block)
         target=self.contract.functions.targetAt(s['laid'],0).call(block_identifier=block)
-        if target!=s['target'] or not 0<target<=MAX256: raise SafetyError('纯挖矿 target 与 state 不一致')
-        return Job(s['laid'],bytes(s['seed']),target,block,s['price'],s['openAt'])
+        if target!=job.target: raise SafetyError('纯挖矿 target 与 state 不一致')
+        return job
     def show(self,j,address):
         expected=(1<<256)/j.target
         log(f'Arc chain={CHAIN} block={j.block} laid={j.laid}/8190 seed=0x{j.seed.hex()}')
@@ -253,16 +303,20 @@ def mine(args,chain,account=None,ledger=None):
         for d in devices:
             w=Worker(d);workers.append(w);selftest(w);sel.register(w.p.stdout,selectors.EVENT_READ,w)
         batch=args.batch or (4096 if args.backend=='cpu' else 1<<20)
-        start=time.monotonic();deadline=start+args.seconds;last_poll=start;last_log=start;hashes=0
+        start=time.monotonic();deadline=start+args.seconds;last_poll=start;last_good=start;last_log=start;hashes=0
+        poll_wait=args.poll
         for w in workers:w.send(job,address,batch)
         while time.monotonic()<deadline:
             now=time.monotonic()
-            if not bench and now-last_poll>=args.poll:
-                fresh=chain.job(deadline=deadline)  # Workers finish at most their current batch, then wait.
-                paused=time.monotonic()-now
-                for worker in workers: worker.sent+=paused
-                if fresh.identity()!=job.identity():job=fresh;log(f'新任务 laid={job.laid} E[hashes]={(1<<256)/job.target:.6g}')
-                last_poll=time.monotonic()
+            if not bench and now-last_poll>=poll_wait:
+                try:
+                    fresh=chain.job(deadline=deadline, poll=True)
+                except RpcReadError as exc:
+                    poll_wait=after_poll_error(str(exc), job, poll_wait, last_good, time.monotonic())
+                    last_poll=time.monotonic()
+                else:
+                    if fresh.identity()!=job.identity():job=fresh;log(f'新任务 laid={job.laid} E[hashes]={(1<<256)/job.target:.6g}')
+                    last_poll=last_good=time.monotonic();poll_wait=args.poll
             if time.monotonic()>=deadline:break
             for key,_ in sel.select(min(.2,max(0,deadline-time.monotonic()))):
                 w=key.data;old,nonce,count,found=w.read();hashes+=count
@@ -299,7 +353,7 @@ def parser():
     p.add_argument('--devices',default='0',help='CUDA 设备索引，如 0,1,2')
     p.add_argument('--threads',type=int,default=1,help='CPU 进程数')
     p.add_argument('--seconds',type=int,default=60)
-    p.add_argument('--poll',type=float,default=2)
+    p.add_argument('--poll',type=float,default=8)
     p.add_argument('--batch',type=int,default=0)
     p.add_argument('--max-gas-cost',type=amount,help='单笔最高 Gas 成本，单位原生 USDC')
     p.add_argument('--budget',type=amount,help='本机钱包累计 Gas 预留预算，单位 USDC')

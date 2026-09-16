@@ -5,11 +5,13 @@ backend=cpu
 devices=0
 threads=1
 address=""
+rpc="https://towerofbabel.fly.dev/rpc/mainnet"
 py="$PWD/.venv/bin/python"
 run() { [[ -x "$py" ]] || { echo '请先选择 2 安装依赖'; return 1; }; "$py" -I "$PWD/babel.py" "$@"; }
 while true; do
   echo
   if [[ "$backend" == cuda ]]; then echo "Babel | CUDA GPU=$devices"; else echo "Babel | CPU进程=$threads"; fi
+  echo "RPC $rpc"
   echo '1 环境检查  2 安装依赖  3 编译  4 测速  5 链上检查'
   echo '6 不付费试运行  7 正式纯挖矿  8 设置  0 退出'
   read -r -p '选择: ' choice || exit 0
@@ -22,7 +24,7 @@ while true; do
       [[ "$choice" == 6 ]] && mode=dry
       [[ "$choice" == 7 ]] && mode=live
       read -r -p '运行秒数（默认60，最高86400）: ' seconds || exit 0
-      args=("$mode" --backend "$backend" --devices "$devices" --threads "$threads" --seconds "${seconds:-60}")
+      args=("$mode" --backend "$backend" --devices "$devices" --threads "$threads" --seconds "${seconds:-60}" --rpc "$rpc")
       if [[ "$mode" != bench ]]; then
         read -r -p "钱包公开地址${address:+（回车保留 $address）}: " entered || exit 0
         address="${entered:-$address}";args+=(--address "$address")
@@ -35,7 +37,7 @@ while true; do
         args+=(--max-gas-cost "$cap" --budget "$budget" --max-txs "${maxtxs:-1}")
       fi
       run "${args[@]}" ;;
-    5) if [[ -n "$address" ]]; then run check --address "$address"; else run check; fi ;;
+    5) if [[ -n "$address" ]]; then run check --rpc "$rpc" --address "$address"; else run check --rpc "$rpc"; fi ;;
     8)
       read -r -p '后端 cpu/cuda（默认cuda）: ' entered || exit 0
       case "${entered:-cuda}" in cpu|cuda) backend="${entered:-cuda}";; *) echo '无效后端';continue;; esac
@@ -45,6 +47,13 @@ while true; do
       else
       read -r -p 'CPU进程数（默认1）: ' threads || exit 0
       threads="${threads:-1}"
+      fi
+      read -r -p "HTTPS RPC（回车保留；网站代理易429，可改 https://rpc.mainnet.arc.io）: " entered || exit 0
+      if [[ -n "${entered:-}" ]]; then
+        case "$entered" in
+          https://*) rpc="$entered" ;;
+          *) echo 'RPC 必须是不含凭据的 https:// 地址' ;;
+        esac
       fi ;;
     0) exit 0 ;;
     *) echo '无效选项' ;;

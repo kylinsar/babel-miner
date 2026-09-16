@@ -48,6 +48,44 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(p.returncode,0,p.stdout+p.stderr)
         last=json.loads(p.stdout.splitlines()[-1]);self.assertGreater(last['hashes'],0)
 
+class RetryTests(unittest.TestCase):
+    def error(self, status):
+        from requests import Response
+        response=Response();response.status_code=status
+        return b.HTTPError('secret URL must never be logged',response=response)
+    def test_transient_reads_recover(self):
+        for error in (self.error(429), self.error(503), b.Timeout(), b.ConnectionError()):
+            fn=Mock(side_effect=[error,'fresh'])
+            with patch.object(b.time,'sleep') as sleep, contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(b.read_retry(fn),'fresh')
+            sleep.assert_called_once_with(2)
+            self.assertNotIn('secret',out.getvalue())
+    def test_retry_limit(self):
+        fn=Mock(side_effect=self.error(503))
+        with patch.object(b.time,'sleep') as sleep, self.assertRaisesRegex(b.SafetyError,'HTTP 503'):
+            b.read_retry(fn)
+        self.assertEqual(fn.call_count,4)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list],[2,4,8])
+    def test_permanent_error_no_retry(self):
+        fn=Mock(side_effect=self.error(403))
+        with patch.object(b.time,'sleep') as sleep, self.assertRaisesRegex(b.SafetyError,'HTTP 403'):
+            b.read_retry(fn)
+        sleep.assert_not_called();self.assertEqual(fn.call_count,1)
+    def test_deadline_blocks_read(self):
+        fn=Mock()
+        with self.assertRaises(b.SafetyError): b.read_retry(fn,0)
+        fn.assert_not_called()
+    def test_budget_errors_never_retried(self):
+        fn=Mock(side_effect=b.SafetyError('budget'))
+        with self.assertRaisesRegex(b.SafetyError,'budget'): b.read_retry(fn)
+        self.assertEqual(fn.call_count,1)
+    def test_menu_cuda_does_not_ask_cpu(self):
+        p=subprocess.run(['bash',str(b.HERE/'babel-menu.sh')],input='8\ncuda\n0\n0\n',capture_output=True,text=True,timeout=5)
+        self.assertEqual(p.returncode,0)
+        self.assertIn('CUDA GPU=0',p.stdout)
+        self.assertNotIn('backend=cuda | devices=0 | CPU=',p.stdout)
+
+
 class SafetyTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory()

@@ -19,6 +19,7 @@ import time
 import warnings
 from dataclasses import dataclass
 from Crypto.Hash import keccak
+from requests.exceptions import HTTPError, ConnectionError, Timeout
 from web3 import Web3
 
 HERE = Path(__file__).resolve().parent
@@ -62,10 +63,37 @@ class Job:
     open_at: int = 1
     def identity(self): return self.laid, self.seed, self.target
 
+def rpc_error_label(exc):
+    # Do not expose URL credentials, request bodies or signed transaction bytes.
+    if isinstance(exc, HTTPError):
+        response = exc.response
+        return f'HTTP {response.status_code}' if response is not None else 'HTTPError（无状态码）'
+    return type(exc).__name__
+
+def read_retry(fn, deadline=None):
+    """Only call with idempotent task reads; never wrap signing/broadcast."""
+    for attempt in range(4):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise SafetyError('运行时间已到，停止读取重试')
+        try:
+            return fn()
+        except (HTTPError, ConnectionError, Timeout) as exc:
+            status = exc.response.status_code if isinstance(exc, HTTPError) and exc.response is not None else None
+            transient = not isinstance(exc, HTTPError) or status in (408, 425, 429, 500, 502, 503, 504)
+            label = rpc_error_label(exc)
+            if not transient or attempt == 3:
+                raise SafetyError(f'RPC任务读取失败：{label}；已停止，没有自动重发交易') from None
+            delay = 2 ** (attempt + 1)
+            if deadline is not None:
+                delay = min(delay, max(0, deadline-time.monotonic()))
+            log(f'RPC任务读取失败：{label}；暂停下发计算任务，{delay:g}秒后重试（{attempt+1}/3）')
+            time.sleep(delay)
+
+
 class Chain:
     def __init__(self, rpc):
         if not rpc.startswith('https://'): raise SafetyError('RPC 必须使用 HTTPS')
-        self.w3=Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout':10}))
+        self.w3=Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout':10}, exception_retry_configuration=None))
         self.contract=self.w3.eth.contract(address=CONTRACT, abi=ABI)
         self.verify()
     def verify(self):
@@ -73,7 +101,9 @@ class Chain:
         expected=json.loads((HERE/'protocol.json').read_text())['code_sha256']
         code=bytes(self.w3.eth.get_code(CONTRACT))
         if not code or hashlib.sha256(code).hexdigest()!=expected: raise SafetyError('合约字节码与固定版本不一致')
-    def job(self):
+    def job(self, deadline=None):
+        return read_retry(self._job, deadline)
+    def _job(self):
         block=self.w3.eth.block_number
         s=dict(zip(FIELDS,self.contract.functions.state().call(block_identifier=block)))
         if s['laid']>=8190: raise SafetyError('所有公开砖块已铸造完毕')
@@ -129,7 +159,7 @@ def validate_tx(tx,address,nonce,gas_cap):
 
 def submit(chain,job,nonce,account,ledger,args,deadline):
     chain.verify()
-    fresh=chain.job()
+    fresh=chain.job(deadline=deadline)
     if fresh.identity()!=job.identity(): log('解已过期，重新挖矿');return False
     if int.from_bytes(work(job.seed,account.address,nonce),'big')>=job.target: raise SafetyError('CPU 复核失败')
     w3=chain.w3
@@ -143,7 +173,7 @@ def submit(chain,job,nonce,account,ledger,args,deadline):
         'nonce':w3.eth.get_transaction_count(account.address,'pending'),'gas':gas,'maxFeePerGas':fee,'maxPriorityFeePerGas':tip}
     validate_tx(tx,account.address,nonce,args.max_gas_cost)
     if w3.eth.get_balance(account.address)<gas*fee: raise SafetyError('Arc USDC 余额不足以覆盖最大 Gas')
-    if chain.job().identity()!=job.identity(): log('签名前任务已变化，丢弃解');return False
+    if chain.job(deadline=deadline).identity()!=job.identity(): log('签名前任务已变化，丢弃解');return False
     if time.monotonic()>=deadline: raise SafetyError('运行时间已到，禁止签名')
     ledger.reserve(tx,args.budget,args.max_txs)
     signed=account.sign_transaction(tx)
@@ -228,7 +258,9 @@ def mine(args,chain,account=None,ledger=None):
         while time.monotonic()<deadline:
             now=time.monotonic()
             if not bench and now-last_poll>=args.poll:
-                fresh=chain.job()  # RPC errors fail closed; workers cleaned up in finally.
+                fresh=chain.job(deadline=deadline)  # Workers finish at most their current batch, then wait.
+                paused=time.monotonic()-now
+                for worker in workers: worker.sent+=paused
                 if fresh.identity()!=job.identity():job=fresh;log(f'新任务 laid={job.laid} E[hashes]={(1<<256)/job.target:.6g}')
                 last_poll=time.monotonic()
             if time.monotonic()>=deadline:break
@@ -236,14 +268,14 @@ def mine(args,chain,account=None,ledger=None):
                 w=key.data;old,nonce,count,found=w.read();hashes+=count
                 if time.monotonic()>=deadline:break
                 if found and old.identity()==job.identity():
-                    fresh=chain.job()
+                    fresh=chain.job(deadline=deadline)
                     if fresh.identity()==old.identity():
                         log(f'HIT nonce=0x{nonce:064x} hash=0x{work(old.seed,address,nonce).hex()}')
                         if args.command=='dry':
                             chain.contract.functions.lay(0,nonce).call({'from':address,'value':0})
                             log('DRY RUN：链上 eth_call 模拟通过，没有签名或广播');return
                         if submit(chain,old,nonce,account,ledger,args,deadline):return
-                    job=chain.job()
+                    job=chain.job(deadline=deadline)
                 w.send(job,address,batch)
             now=time.monotonic()
             if any(w.p.poll() is not None for w in workers):raise SafetyError('计算进程已退出')
@@ -309,5 +341,5 @@ if __name__=='__main__':
     except Exception as exc:
         # Never print raw RPC requests, private keys or signed transaction bytes.
         if isinstance(exc,(SafetyError,argparse.ArgumentTypeError,FileNotFoundError)):log(f'停止：{exc}')
-        else:log(f'停止：{type(exc).__name__}；请检查 RPC、依赖和服务器环境，未自动重试交易')
+        else:log(f'停止：{rpc_error_label(exc)}；请检查 RPC、依赖和服务器环境，未自动重试交易')
         sys.exit(1)

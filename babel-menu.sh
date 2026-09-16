@@ -9,7 +9,7 @@ py="$PWD/.venv/bin/python"
 run() { [[ -x "$py" ]] || { echo '请先选择 2 安装依赖'; return 1; }; "$py" -I "$PWD/babel.py" "$@"; }
 while true; do
   echo
-  echo "Babel | backend=$backend | devices=$devices | CPU=$threads"
+  if [[ "$backend" == cuda ]]; then echo "Babel | CUDA GPU=$devices"; else echo "Babel | CPU进程=$threads"; fi
   echo '1 环境检查  2 安装依赖  3 编译  4 测速  5 链上检查'
   echo '6 不付费试运行  7 正式纯挖矿  8 设置  0 退出'
   read -r -p '选择: ' choice || exit 0
@@ -39,10 +39,13 @@ while true; do
     8)
       read -r -p '后端 cpu/cuda（默认cuda）: ' entered || exit 0
       case "${entered:-cuda}" in cpu|cuda) backend="${entered:-cuda}";; *) echo '无效后端';continue;; esac
+      if [[ "$backend" == cuda ]]; then
       read -r -p 'CUDA GPU索引，逗号分隔（默认0，例如0,1,2,3）: ' devices || exit 0
       devices="${devices:-0}"
+      else
       read -r -p 'CPU进程数（默认1）: ' threads || exit 0
-      threads="${threads:-1}" ;;
+      threads="${threads:-1}"
+      fi ;;
     0) exit 0 ;;
     *) echo '无效选项' ;;
   esac

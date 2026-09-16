@@ -1,0 +1,13 @@
+{
+  "chain_id": 5042,
+  "contract": "0x07b5AB324fFD5f2CcCfd178B8f225E5419C5736c",
+  "code_sha256": "de4ee401c4aac944d0bef44a7bca0d8e96303b6fde99996c1219f3e60c82b3bf",
+  "observed_date": "2026-09-16",
+  "website": "https://towerofbabel.fly.dev/mine",
+  "pow": "keccak256(seed[32] || sender[20] || nonce_be[32]); digest < targetAt(laid,0)",
+  "assets": {
+    "mine": "ff9918463c3886c420ed733c1b545af06fb36029e6e4f521b3298e2e1a0abd8a",
+    "chain": "1979742c180ad2757d090a25133fb1343d95c8b8a6cb0aedc31c36ba90f1cdf3",
+    "gpu": "a94d8ef713bcbc58a1919426ff039395520cf431b2c417986a83426cc696dbf7"
+  }
+}

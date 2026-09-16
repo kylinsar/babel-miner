@@ -1,0 +1,2 @@
+web3==7.13.0
+pycryptodome==3.23.0

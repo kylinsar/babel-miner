@@ -3,7 +3,6 @@
 import argparse
 import contextlib
 import fcntl
-import getpass
 import hashlib
 import json
 import math
@@ -16,17 +15,22 @@ import signal
 import subprocess
 import sys
 import time
-import warnings
 from dataclasses import dataclass
 from Crypto.Hash import keccak
 from requests.exceptions import HTTPError, ConnectionError, Timeout
 from web3 import Web3
+from core.safety import (
+    SafetyError, RpcReadError, log, parse_cuda_devices, amount, fmt,
+    MAX256, POLL_BACKOFF_MIN, POLL_BACKOFF_MAX, STALE_POLL,
+    rpc_error_label, http_status, transient_rpc, retry_delay, read_retry,
+    after_poll_error,
+)
+from core.ledger import Ledger as CoreLedger
 
 HERE = Path(__file__).resolve().parent
 CHAIN = 5042
 CONTRACT = Web3.to_checksum_address('0x07b5AB324fFD5f2CcCfd178B8f225E5419C5736c')
 RPC = 'https://towerofbabel.fly.dev/rpc/mainnet'
-MAX256 = (1 << 256) - 1
 FIELDS = ['laid','seed','openAt','price','target','floor','pot','closeAt','coinWeight','sweatWeight','coinIn','tillPaid','day','buildersOwed','vault']
 ABI = [
  {'type':'function','name':'state','stateMutability':'view','inputs':[], 'outputs':[{'type':'tuple','components':[{'name':k,'type':'bytes32' if k=='seed' else 'uint256'} for k in FIELDS]}]},
@@ -34,35 +38,10 @@ ABI = [
  {'type':'function','name':'lay','stateMutability':'payable','inputs':[{'name':'sponsor','type':'uint256'},{'name':'nonce','type':'uint256'}],'outputs':[{'type':'uint256'}]},
 ]
 
-class SafetyError(Exception): pass
-class RpcReadError(SafetyError): pass
-
-POLL_BACKOFF_MIN = 15
-POLL_BACKOFF_MAX = 60
-STALE_POLL = 180
-
-def log(msg): print(time.strftime('[%H:%M:%S]'), msg, flush=True)
 def kh(data): return keccak.new(digest_bits=256, data=data).digest()
 def work(seed, address, nonce):
     if len(seed)!=32 or not 0 <= nonce <= MAX256: raise SafetyError('无效 PoW 输入')
     return kh(seed + bytes.fromhex(address.removeprefix('0x')) + nonce.to_bytes(32,'big'))
-def parse_cuda_devices(raw):
-    parts=[p.strip() for p in re.split(r'[,，、;；]+', raw.strip()) if p.strip()]
-    if not parts or not all(p.isdigit() for p in parts) or len(set(parts))!=len(parts):
-        raise SafetyError(f'devices 必须为不重复的阿拉伯数字索引，用英文逗号分隔，例如 0,1,2；当前={raw!r}')
-    return parts
-
-def amount(raw):
-    if not re.fullmatch(r'[0-9]{1,9}(?:\.[0-9]{1,18})?', raw): raise argparse.ArgumentTypeError('请填普通正数，最多18位小数')
-    whole, _, frac = raw.partition('.')
-    value=int(whole)*10**18+int(frac.ljust(18,'0'))
-    if value<=0: raise argparse.ArgumentTypeError('金额必须大于0')
-    return value
-
-def fmt(n):
-    whole, frac = divmod(n, 10**18)
-    tail = f'{frac:018d}'.rstrip('0')
-    return str(whole) + ('.' + tail if tail else '')
 
 @dataclass(frozen=True)
 class Job:
@@ -73,62 +52,6 @@ class Job:
     price: int = 0
     open_at: int = 1
     def identity(self): return self.laid, self.seed, self.target
-
-def rpc_error_label(exc):
-    # Do not expose URL credentials, request bodies or signed transaction bytes.
-    if isinstance(exc, HTTPError):
-        response = exc.response
-        return f'HTTP {response.status_code}' if response is not None else 'HTTPError（无状态码）'
-    return type(exc).__name__
-
-def http_status(exc):
-    if isinstance(exc, HTTPError) and exc.response is not None:
-        return exc.response.status_code
-    return None
-
-def transient_rpc(exc):
-    if not isinstance(exc, HTTPError):
-        return True
-    return http_status(exc) in (408, 425, 429, 500, 502, 503, 504)
-
-def retry_delay(exc, attempt):
-    response = exc.response if isinstance(exc, HTTPError) else None
-    raw = response.headers.get('Retry-After') if response is not None and response.headers else None
-    if raw and re.fullmatch(r'[0-9]{1,4}', raw.strip()):
-        return min(max(int(raw.strip()), 1), POLL_BACKOFF_MAX)
-    if http_status(exc) == 429:
-        return min(POLL_BACKOFF_MIN * (2 ** attempt), POLL_BACKOFF_MAX)
-    return 2 ** (attempt + 1)
-
-def read_retry(fn, deadline=None):
-    """Only call with idempotent task reads; never wrap signing/broadcast."""
-    attempt = 0
-    while True:
-        if deadline is not None and time.monotonic() >= deadline:
-            raise SafetyError('运行时间已到，停止读取重试')
-        try:
-            return fn()
-        except (HTTPError, ConnectionError, Timeout) as exc:
-            label = rpc_error_label(exc)
-            if not transient_rpc(exc) or (deadline is None and attempt >= 3):
-                raise RpcReadError(f'RPC任务读取失败：{label}；已停止，没有自动重发交易') from None
-            delay = retry_delay(exc, min(attempt, 4))
-            if deadline is not None:
-                remain = deadline - time.monotonic()
-                if remain <= 0:
-                    raise SafetyError('运行时间已到，停止读取重试') from None
-                delay = min(delay, remain)
-            log(f'RPC任务读取失败：{label}；{delay:g}秒后重试（第{attempt+1}次；不重发交易）')
-            time.sleep(delay)
-            attempt += 1
-
-def after_poll_error(label, job, poll_wait, last_good, now):
-    if now - last_good > STALE_POLL:
-        raise SafetyError(f'RPC 已连续 {STALE_POLL} 秒不可用，已停止，没有自动重发交易')
-    wait = min(max(poll_wait * 2, POLL_BACKOFF_MIN), POLL_BACKOFF_MAX)
-    log(f'RPC轮询 {label}；GPU继续当前 laid={job.laid}，{wait:g}秒后再查（不停止、不重发交易）')
-    return wait
-
 
 class Chain:
     def __init__(self, rpc):
@@ -173,37 +96,10 @@ class Chain:
         log(f'纯挖矿 value=0 USDC；付费铸造参考价={fmt(j.price)} USDC；E[hashes]={expected:.6g} bits={math.log2(expected):.3f}')
         if address: log(f'钱包 {address}，余额={fmt(self.w3.eth.get_balance(address))} USDC（native，18位精度）')
 
-class Ledger:
+class Ledger(CoreLedger):
     """Lock per chain/contract/wallet. Reservations persist before signing."""
     def __init__(self, address):
-        self.directory=Path.home()/'.local/state/babel-miner'
-        self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
-        stem=f'{CHAIN}-{CONTRACT.lower()}-{address.lower()}'
-        self.path=self.directory/(stem+'.jsonl')
-        self.fd=os.open(self.directory/(stem+'.lock'),os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
-        try: fcntl.flock(self.fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BaseException:
-            os.close(self.fd);raise SafetyError('本机同一钱包已有正式进程')
-    def close(self): os.close(self.fd)
-    def records(self):
-        if not self.path.exists(): return []
-        try:
-            records=[json.loads(s) for s in self.path.read_text().splitlines()]
-            for r in records:
-                if type(r['reserved']) is not int or r['reserved']<=0 or type(r['nonce']) is not int or r['nonce']<0: raise ValueError()
-            return records
-        except (KeyError,ValueError,TypeError): raise SafetyError('预算账本损坏，停止签名')
-    def reserve(self, tx, budget, max_txs):
-        records=self.records();cost=tx['gas']*tx['maxFeePerGas']
-        if len(records)>=max_txs: raise SafetyError('累计签名笔数已达上限')
-        if any(r['nonce']==tx['nonce'] for r in records): raise SafetyError('nonce 已有预留，请核查历史交易')
-        if sum(r['reserved'] for r in records)+cost>budget: raise SafetyError('累计 Gas 预算不足')
-        record={'nonce':tx['nonce'],'reserved':cost,'time':int(time.time()),'tx':tx}
-        fd=os.open(self.path,os.O_WRONLY|os.O_CREAT|os.O_APPEND|os.O_NOFOLLOW,0o600)
-        with os.fdopen(fd,'a') as f: f.write(json.dumps(record)+'\n'); f.flush();os.fsync(f.fileno())
-        fd=os.open(self.directory,os.O_RDONLY)
-        try: os.fsync(fd)
-        finally: os.close(fd)
+        super().__init__(address, app='babel-miner', chain_id=CHAIN, contract=CONTRACT)
 
 def validate_tx(tx,address,nonce,gas_cap):
     expected='0x'+(kh(b'lay(uint256,uint256)')[:4]+bytes(32)+nonce.to_bytes(32,'big')).hex()
@@ -233,23 +129,9 @@ def submit(chain,job,nonce,account,ledger,args,deadline):
     if time.monotonic()>=deadline: raise SafetyError('运行时间已到，禁止签名')
     ledger.reserve(tx,args.budget,args.max_txs)
     signed=account.sign_transaction(tx)
-    local_hash=Web3.to_hex(kh(bytes(signed.raw_transaction)))
-    # This hash is known even if the network loses the broadcast response.
-    log(f'签名交易 {local_hash}；最高 Gas={fmt(gas*fee)} USDC；预留不会自动释放')
-    if time.monotonic()>=deadline: raise SafetyError('签名后到期，未广播；预留保留')
-    try: returned=w3.eth.send_raw_transaction(signed.raw_transaction)
-    except Exception: raise SafetyError(f'广播结果未知，请查询 {local_hash}；不会自动重试或释放预算') from None
-    if Web3.to_hex(returned).lower()!=local_hash.lower(): raise SafetyError('RPC 返回的交易哈希不匹配')
-    log(f'已广播 https://explorer.arc.io/tx/{local_hash}')
-    until=min(deadline,time.monotonic()+120)
-    from web3.exceptions import TransactionNotFound
-    while time.monotonic()<until:
-        try: receipt=w3.eth.get_transaction_receipt(returned)
-        except TransactionNotFound: time.sleep(1);continue
-        if receipt['status']!=1: raise SafetyError('交易失败：Gas 已消耗，未获得砖块；程序停止')
-        log(f'铸造成功 block={receipt["blockNumber"]} gasUsed={receipt["gasUsed"]}；本次运行结束')
-        return True
-    raise SafetyError(f'交易仍待确认：{local_hash}；停止，不重发')
+    from core.broadcast import broadcast_once
+    return broadcast_once(w3, signed, deadline=deadline, symbol='USDC', explorer_base='https://explorer.arc.io/tx',
+                          reserved_cost=gas*fee, fail_noun='砖块')
 
 class Worker:
     def __init__(self,device):
@@ -298,56 +180,25 @@ def selftest(worker):
     log(f'{worker.device} Keccak 自测通过（含高位 nonce 与跨32位计数）')
 
 def mine(args,chain,account=None,ledger=None):
-    bench=args.command=='bench';address=args.address
-    if bench: address=address or '0x'+'11'*20
-    job=Job(0,bytes.fromhex('22'*32),0) if bench else chain.job()
-    if not bench: chain.show(job,address)
-    devices=['cpu']*args.threads if args.backend=='cpu' else parse_cuda_devices(args.devices)
-    workers=[];sel=selectors.DefaultSelector()
-    try:
-        for d in devices:
-            w=Worker(d);workers.append(w);selftest(w);sel.register(w.p.stdout,selectors.EVENT_READ,w)
-        batch=args.batch or (4096 if args.backend=='cpu' else 1<<20)
-        start=time.monotonic();deadline=start+args.seconds;last_poll=start;last_good=start;last_log=start;hashes=0
-        poll_wait=args.poll
-        for w in workers:w.send(job,address,batch)
-        while time.monotonic()<deadline:
-            now=time.monotonic()
-            if not bench and now-last_poll>=poll_wait:
-                try:
-                    fresh=chain.job(deadline=deadline, poll=True)
-                except RpcReadError as exc:
-                    poll_wait=after_poll_error(str(exc), job, poll_wait, last_good, time.monotonic())
-                    last_poll=time.monotonic()
-                else:
-                    if fresh.identity()!=job.identity():job=fresh;log(f'新任务 laid={job.laid} E[hashes]={(1<<256)/job.target:.6g}')
-                    last_poll=last_good=time.monotonic();poll_wait=args.poll
-            if time.monotonic()>=deadline:break
-            for key,_ in sel.select(min(.2,max(0,deadline-time.monotonic()))):
-                w=key.data;old,nonce,count,found=w.read();hashes+=count
-                if time.monotonic()>=deadline:break
-                if found and old.identity()==job.identity():
-                    fresh=chain.job(deadline=deadline)
-                    if fresh.identity()==old.identity():
-                        log(f'HIT nonce=0x{nonce:064x} hash=0x{work(old.seed,address,nonce).hex()}')
-                        if args.command=='dry':
-                            chain.contract.functions.lay(0,nonce).call({'from':address,'value':0})
-                            log('DRY RUN：链上 eth_call 模拟通过，没有签名或广播');return
-                        if submit(chain,old,nonce,account,ledger,args,deadline):return
-                    job=chain.job(deadline=deadline)
-                w.send(job,address,batch)
-            now=time.monotonic()
-            if any(w.p.poll() is not None for w in workers):raise SafetyError('计算进程已退出')
-            if any(now-w.sent>60 for w in workers):raise SafetyError('计算批次超过60秒；请减小 --batch')
-            if now-last_log>=5:
-                rate=hashes/(now-start);eta=(1<<256)/job.target/rate if job.target and rate else 0
-                log(f'{len(workers)} workers {rate/1e9:.6f} GH/s hashes={hashes}'+(f' eta~{eta/3600:.2f}h（统计平均）' if job.target else ''))
-                last_log=now
-        elapsed=time.monotonic()-start
-        print(json.dumps({'type':'bench' if bench else 'stopped','hashes':hashes,'seconds':round(elapsed,3),'hps':int(hashes/elapsed)}),flush=True)
-    finally:
-        for w in workers:w.close()
-        sel.close()
+    from core.engine import run_native
+    bench=args.command=='bench'
+    def fetch_job(deadline=None, poll=False):
+        if bench: return Job(0,bytes.fromhex('22'*32),0)
+        return chain.job(deadline=deadline, poll=poll)
+    def on_hit(job,address,nonce,deadline):
+        log(f'HIT nonce=0x{nonce:064x} hash=0x{work(job.seed,address,nonce).hex()}')
+        if args.command=='dry':
+            chain.contract.functions.lay(0,nonce).call({'from':address,'value':0})
+            log('DRY RUN：链上 eth_call 模拟通过，没有签名或广播')
+            return
+        submit(chain,job,nonce,account,ledger,args,deadline)
+    run_native(
+        command=args.command, address=args.address, backend=args.backend, devices=args.devices,
+        threads=args.threads, seconds=args.seconds, poll=args.poll, batch=args.batch,
+        fetch_job=fetch_job, show_job=(lambda job, addr: chain.show(job, addr)),
+        spawn_worker=Worker, selftest=selftest, on_hit=on_hit,
+        job_target=lambda j: j.target, job_label=lambda j: f'laid={j.laid}',
+    )
 
 def parser():
     p=argparse.ArgumentParser(description=__doc__)
@@ -362,17 +213,18 @@ def parser():
     p.add_argument('--batch',type=int,default=0)
     p.add_argument('--max-gas-cost',type=amount,help='单笔最高 Gas 成本，单位原生 USDC')
     p.add_argument('--budget',type=amount,help='本机钱包累计 Gas 预留预算，单位 USDC')
-    p.add_argument('--max-txs',type=int,default=1,help='累计签名次数；每次运行最多提交一笔')
+    p.add_argument('--max-txs',type=int,help='该钱包累计签名笔数上限，含历史预留')
     return p
 
 def main():
     args=parser().parse_args()
-    if not 1<=args.seconds<=86400 or not 1<=args.threads<=128 or not 0.5<=args.poll<=60 or not 0<=args.batch<=1<<26 or args.max_txs<1:raise SafetyError('时长/线程/轮询/批次/笔数参数越界')
+    if not 1<=args.seconds<=86400 or not 1<=args.threads<=128 or not 0.5<=args.poll<=60 or not 0<=args.batch<=1<<26:raise SafetyError('时长/线程/轮询/批次参数越界')
+    if args.max_txs is not None and args.max_txs<1:raise SafetyError('签名笔数上限必须≥1')
     if args.address:
         if not Web3.is_address(args.address):raise SafetyError('钱包地址格式无效')
         args.address=Web3.to_checksum_address(args.address)
     if args.command in ('dry','live') and not args.address:raise SafetyError('必须指定 --address 公开钱包地址')
-    if args.command=='live' and (not args.budget or not args.max_gas_cost):raise SafetyError('正式模式必须设置 --budget 与 --max-gas-cost（单位 USDC）')
+    if args.command=='live' and (not args.budget or not args.max_gas_cost or not args.max_txs):raise SafetyError('正式模式必须设置 --budget、--max-gas-cost 与 --max-txs')
     chain=None if args.command=='bench' else Chain(args.rpc)
     if args.command=='check':chain.show(chain.job(),args.address);return
     if args.command!='live':mine(args,chain);return
@@ -380,12 +232,13 @@ def main():
         records=ledger.records()
         if len(records)>=args.max_txs or sum(r['reserved'] for r in records)>=args.budget:raise SafetyError('历史预留已用尽预算或签名次数')
         chain.show(chain.job(),args.address)
-        print(f'正式模式：value=0，sponsor=0；单笔Gas≤{fmt(args.max_gas_cost)} USDC；累计≤{fmt(args.budget)} USDC。')
-        print('最多提交一笔后退出。不同服务器的预算/nonce不共享；请勿多机使用同一私钥。')
-        if input('允许真实支付 Gas，请输入 START: ').strip()!='START':raise SafetyError('已取消')
-        with warnings.catch_warnings():
-            warnings.simplefilter('error',getpass.GetPassWarning)
-            key=getpass.getpass('独立钱包私钥（隐藏输入，不保存）: ').strip()
+        print('正式模式会按设定时长持续挖矿。预算账本按本机用户和钱包保存，不随重启清零。')
+        print('每笔预留 Gas；失败、未广播、pending 均不自动释放。找到解不会结束本次运行。')
+        print(f'value=0，sponsor=0；单笔Gas≤{fmt(args.max_gas_cost)} USDC；累计≤{fmt(args.budget)} USDC；累计签名≤{args.max_txs}。')
+        print('不同服务器请用不同钱包；跨服务器不共享预算和 nonce 锁。')
+        if input('确认真实付费输入 START: ').strip()!='START':raise SafetyError('已取消')
+        from core.keys import read_private_key
+        key=read_private_key('BABEL_PRIVATE_KEY','POW_PRIVATE_KEY','PRIVATE_KEY')
         try:account=chain.w3.eth.account.from_key(key)
         except Exception:raise SafetyError('私钥格式无效') from None
         finally:key=None

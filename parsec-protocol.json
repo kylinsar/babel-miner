@@ -1,0 +1,10 @@
+{
+  "chain_id": 5042,
+  "contract": "0x631f96907126Ae23313Ec8DF489da0879AACfC98",
+  "code_sha256": "62ea41b7240de32ab274ff53637109858bfb258a0cf11bac407dad86664c1218",
+  "observed_date": "2026-09-16",
+  "website": "https://parsecxyz.fun/",
+  "max_parsecs": 8800,
+  "pow": "keccak256(entropy[32] || sender[20] || nonce_be[32]); digest <= proofTarget(requiredWorkFor(tokenId, 0))",
+  "mint": "mint(nonce) value=0"
+}

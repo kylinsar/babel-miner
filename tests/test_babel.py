@@ -111,10 +111,13 @@ class RetryTests(unittest.TestCase):
         with self.assertRaisesRegex(b.SafetyError,'budget'): b.read_retry(fn)
         self.assertEqual(fn.call_count,1)
     def test_menu_cuda_does_not_ask_cpu(self):
-        p=subprocess.run(['bash',str(b.HERE/'babel-menu.sh')],input='8\ncuda\n0\n\n0\n',capture_output=True,text=True,timeout=5)
-        self.assertEqual(p.returncode,0)
+        state=tempfile.TemporaryDirectory(dir=str(b.HERE));self.addCleanup(state.cleanup)
+        env=os.environ.copy();env['POW_STATE_DIR']=state.name
+        p=subprocess.run(['bash',str(b.HERE/'babel-menu.sh')],input='2\ncuda\n0\n\n\n\n0\n',capture_output=True,text=True,timeout=5,env=env,encoding='utf-8',errors='replace')
+        self.assertEqual(p.returncode,0,p.stderr)
         self.assertIn('CUDA GPU=0',p.stdout)
         self.assertNotIn('backend=cuda | devices=0 | CPU=',p.stdout)
+        self.assertIn('1 系统信息  2 设置  3 安装  4 编译',p.stdout)
 
 
 class SafetyTests(unittest.TestCase):

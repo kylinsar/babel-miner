@@ -46,6 +46,12 @@ def kh(data): return keccak.new(digest_bits=256, data=data).digest()
 def work(seed, address, nonce):
     if len(seed)!=32 or not 0 <= nonce <= MAX256: raise SafetyError('无效 PoW 输入')
     return kh(seed + bytes.fromhex(address.removeprefix('0x')) + nonce.to_bytes(32,'big'))
+def parse_cuda_devices(raw):
+    parts=[p.strip() for p in re.split(r'[,，、;；]+', raw.strip()) if p.strip()]
+    if not parts or not all(p.isdigit() for p in parts) or len(set(parts))!=len(parts):
+        raise SafetyError(f'devices 必须为不重复的阿拉伯数字索引，用英文逗号分隔，例如 0,1,2；当前={raw!r}')
+    return parts
+
 def amount(raw):
     if not re.fullmatch(r'[0-9]{1,9}(?:\.[0-9]{1,18})?', raw): raise argparse.ArgumentTypeError('请填普通正数，最多18位小数')
     whole, _, frac = raw.partition('.')
@@ -296,8 +302,7 @@ def mine(args,chain,account=None,ledger=None):
     if bench: address=address or '0x'+'11'*20
     job=Job(0,bytes.fromhex('22'*32),0) if bench else chain.job()
     if not bench: chain.show(job,address)
-    devices=['cpu']*args.threads if args.backend=='cpu' else args.devices.split(',')
-    if args.backend=='cuda' and (not all(d.isdigit() for d in devices) or len(set(devices))!=len(devices)):raise SafetyError('devices 必须为不重复的索引，例如 0,1,2')
+    devices=['cpu']*args.threads if args.backend=='cpu' else parse_cuda_devices(args.devices)
     workers=[];sel=selectors.DefaultSelector()
     try:
         for d in devices:

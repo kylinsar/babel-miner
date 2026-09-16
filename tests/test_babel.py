@@ -20,6 +20,12 @@ class ProtocolTests(unittest.TestCase):
     def test_site_vector(self):
         # Produced independently by the live site's gpuMiner-Di_dSJHy.js exports k/p/h.
         self.assertEqual(b.work(bytes.fromhex('00'*31+'01'),'0x000000000000000000000000000000000000dEaD',0).hex(),'66a517900a5e1fad20e92c2f95fbbafcb5dbda299ba0201f5fde4e50dbbfbe16')
+    def test_cuda_devices_accept_chinese_commas(self):
+        self.assertEqual(b.parse_cuda_devices('0,1,2,3,4,5'), ['0','1','2','3','4','5'])
+        self.assertEqual(b.parse_cuda_devices('0，1、2;3'), ['0','1','2','3'])
+        for raw in ('', '0,0', '0，0', 'cpu', '0, 1a', '-1'):
+            with self.assertRaises(b.SafetyError):
+                b.parse_cuda_devices(raw)
     def test_amount(self):
         self.assertEqual(b.amount('0.045'),45000000000000000)
         self.assertEqual(b.amount('999999999.123456789012345678'),999999999123456789012345678)

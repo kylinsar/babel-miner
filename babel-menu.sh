@@ -42,8 +42,9 @@ while true; do
       read -r -p '后端 cpu/cuda（默认cuda）: ' entered || exit 0
       case "${entered:-cuda}" in cpu|cuda) backend="${entered:-cuda}";; *) echo '无效后端';continue;; esac
       if [[ "$backend" == cuda ]]; then
-      read -r -p 'CUDA GPU索引，逗号分隔（默认0，例如0,1,2,3）: ' devices || exit 0
+      read -r -p 'CUDA GPU索引，英文逗号分隔（默认0，例如 0,1,2,3,4,5）: ' devices || exit 0
       devices="${devices:-0}"
+      devices="${devices//，/,}"; devices="${devices//、/,}"; devices="${devices// /}"
       else
       read -r -p 'CPU进程数（默认1）: ' threads || exit 0
       threads="${threads:-1}"
